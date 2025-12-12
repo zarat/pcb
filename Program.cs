@@ -3,8 +3,11 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 public class Program
@@ -253,6 +256,24 @@ class Program2
     static StreamReader? ServerReader;
     static StreamWriter? ServerWriter;
 
+    // ===================== /cmd support (SAFE built-in diagnostics) =====================
+    // Protocol over existing peer text stream:
+    //   CMDREQ <id> <b64(cmdline)>
+    //   CMDACK <id> OK|NO
+    //   CMDOUT <id> <b64(chunk)>
+    //   CMDEND <id>
+    sealed record CmdReq(string Id, string Peer, string CmdLine, DateTime SentAt);
+    static readonly ConcurrentDictionary<string, CmdReq> PendingCmd = new(StringComparer.OrdinalIgnoreCase);
+    static readonly ConcurrentDictionary<string, CancellationTokenSource> RunningCmd = new(StringComparer.OrdinalIgnoreCase);
+
+    static readonly HttpClient Http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
+    {
+        Timeout = TimeSpan.FromSeconds(12)
+    };
+
+    static string ToB64(string s) => Convert.ToBase64String(Utf8NoBom.GetBytes(s));
+    static string FromB64(string b64) => Utf8NoBom.GetString(Convert.FromBase64String(b64));
+
     public static async Task RunAsync(string[] args)
     {
         // offline: [my_p2p_port]
@@ -403,6 +424,58 @@ class Program2
                 continue;
             }
 
+            // --------- NEW: /cmd and /cmdend ----------
+            if (line.StartsWith("/cmdend ", StringComparison.OrdinalIgnoreCase))
+            {
+                // /cmdend <peer> <id>
+                var p = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length < 3) { Console.WriteLine("[CMD] Usage: /cmdend <peer> <id>"); continue; }
+                await SendToPeer(p[1], $"CMDEND {p[2]}");
+                Console.WriteLine($"[CMD] end sent to {p[1]} id={p[2]}");
+                continue;
+            }
+
+            if (line.StartsWith("/cmd ", StringComparison.OrdinalIgnoreCase))
+            {
+                // /cmd <peer> <cmdline>
+                var p = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length < 3)
+                {
+                    Console.WriteLine("[CMD] Usage: /cmd <peer> <cmdline>");
+                    Console.WriteLine("[CMD] cmdline examples:");
+                    Console.WriteLine("      dns example.com");
+                    Console.WriteLine("      ping example.com 4");
+                    Console.WriteLine("      tcp example.com 443");
+                    Console.WriteLine("      http https://example.com");
+                    Console.WriteLine("      trace example.com 20");
+                    Console.WriteLine("      ifaces");
+                    continue;
+                }
+
+                var peer = p[1];
+                var cmdLine = p[2];
+
+                if (!Peers.ContainsKey(peer))
+                {
+                    Console.WriteLine($"[CMD] unknown peer '{peer}'");
+                    continue;
+                }
+
+                if (!IsSupportedDiagCommand(cmdLine, out var why))
+                {
+                    Console.WriteLine($"[CMD] blocked/unknown command: {why}");
+                    Console.WriteLine("[CMD] supported: dns, ping, tcp, http, trace, ifaces");
+                    continue;
+                }
+
+                var id = Guid.NewGuid().ToString("N");
+                PendingCmd[id] = new CmdReq(id, peer, cmdLine, DateTime.Now);
+                await SendToPeer(peer, $"CMDREQ {id} {ToB64(cmdLine)}");
+                Console.WriteLine($"[CMD] request sent -> {peer} id={id}: {cmdLine}");
+                continue;
+            }
+            // -----------------------------------------
+
             if (line.StartsWith("/p ", StringComparison.OrdinalIgnoreCase))
             {
                 var rest = line.Substring(3);
@@ -519,12 +592,23 @@ class Program2
         Console.WriteLine("  /accept <user>                      (Offer annehmen -> P2P verbinden)");
         Console.WriteLine("  /deny <user>                        (Offer ablehnen)");
         Console.WriteLine("  /p <peer> <text>                    (P2P Nachricht)");
+        Console.WriteLine("  /cmd <peer> <cmdline>               (Remote-DIAG Anfrage; Empfänger MUSS bestätigen)");
+        Console.WriteLine("                                     cmdline: dns|ping|tcp|http|trace|ifaces");
+        Console.WriteLine("  /cmdend <peer> <id>                 (Remote-DIAG abbrechen)");
         Console.WriteLine("  /fsend <peer> <filepath>            (Datei an verbundenen Peer senden)");
         Console.WriteLine("  /fsendip <ip> <port> <filepath>     (Datei direkt an IP/Port senden)");
         Console.WriteLine("  /plist                              (aktive Peers)");
         Console.WriteLine("  /pclose <peer>                      (Peer schließen)");
         Console.WriteLine("  /pcloseall                          (alle schließen)");
         Console.WriteLine("  /help");
+        Console.WriteLine();
+        Console.WriteLine("CMD examples:");
+        Console.WriteLine("  /cmd Bob dns example.com");
+        Console.WriteLine("  /cmd Bob ping example.com 4");
+        Console.WriteLine("  /cmd Bob tcp example.com 443");
+        Console.WriteLine("  /cmd Bob http https://example.com");
+        Console.WriteLine("  /cmd Bob trace example.com 20");
+        Console.WriteLine("  /cmd Bob ifaces");
     }
 
     // ================= SERVER CONNECT/DISCONNECT =================
@@ -874,6 +958,29 @@ class Program2
                     break;
                 }
 
+                // ---- intercept CMD protocol lines ----
+                if (line.StartsWith("CMDREQ ", StringComparison.OrdinalIgnoreCase))
+                {
+                    _ = Task.Run(() => HandleCmdReqAsync(pc, line));
+                    continue;
+                }
+                if (line.StartsWith("CMDACK ", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleCmdAck(pc, line);
+                    continue;
+                }
+                if (line.StartsWith("CMDOUT ", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleCmdOut(pc, line);
+                    continue;
+                }
+                if (line.StartsWith("CMDEND ", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleCmdEnd(pc, line);
+                    continue;
+                }
+                // --------------------------------------
+
                 Console.WriteLine($"[P2P {pc.Name}] {line}");
             }
         }
@@ -903,6 +1010,413 @@ class Program2
             return (name.Length > 0 ? name : null, port);
         }
         return (null, 0);
+    }
+
+    // ===================== CMD handlers =====================
+
+    static bool IsSupportedDiagCommand(string cmdLine, out string reason)
+    {
+        reason = "";
+        if (string.IsNullOrWhiteSpace(cmdLine)) { reason = "empty"; return false; }
+        if (cmdLine.Length > 300) { reason = "too long"; return false; }
+
+        var parts = cmdLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var verb = parts[0].ToLowerInvariant();
+
+        switch (verb)
+        {
+            case "dns":
+                if (parts.Length < 2) { reason = "dns <host>"; return false; }
+                return true;
+            case "ping":
+                if (parts.Length < 2) { reason = "ping <host> [count]"; return false; }
+                return true;
+            case "tcp":
+                if (parts.Length < 3 || !int.TryParse(parts[2], out var port) || port <= 0 || port > 65535)
+                { reason = "tcp <host> <port>"; return false; }
+                return true;
+            case "http":
+                if (parts.Length < 2) { reason = "http <url>"; return false; }
+                return true;
+            case "trace":
+                if (parts.Length < 2) { reason = "trace <host> [maxHops]"; return false; }
+                return true;
+            case "ifaces":
+                return true;
+            default:
+                reason = "unknown verb";
+                return false;
+        }
+    }
+
+    static async Task HandleCmdReqAsync(PeerConn pc, string line)
+    {
+        // CMDREQ <id> <b64(cmdline)>
+        var parts = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3) return;
+
+        var id = parts[1];
+        string cmdLine;
+        try { cmdLine = FromB64(parts[2]); }
+        catch
+        {
+            await SafeWriteAsync(pc, $"CMDACK {id} NO");
+            return;
+        }
+
+        if (!IsSupportedDiagCommand(cmdLine, out var why))
+        {
+            await SafeWriteAsync(pc, $"CMDACK {id} NO");
+            Console.WriteLine($"[CMD] blocked incoming from {pc.Name}: {cmdLine} ({why})");
+            return;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine($"[CMD] {pc.Name} requests: {cmdLine}");
+        Console.Write($"      Allow? (y/N): ");
+        var ans = (Console.ReadLine() ?? "").Trim();
+
+        if (!ans.Equals("y", StringComparison.OrdinalIgnoreCase) &&
+            !ans.Equals("yes", StringComparison.OrdinalIgnoreCase))
+        {
+            await SafeWriteAsync(pc, $"CMDACK {id} NO");
+            Console.WriteLine($"[CMD] denied id={id}");
+            return;
+        }
+
+        await SafeWriteAsync(pc, $"CMDACK {id} OK");
+
+        var cts = new CancellationTokenSource();
+        if (!RunningCmd.TryAdd(id, cts))
+        {
+            await SafeWriteAsync(pc, $"CMDEND {id}");
+            return;
+        }
+
+        try
+        {
+            var output = await RunDiagAsync(cmdLine, cts.Token);
+            await SendCmdOutChunkedAsync(pc, id, output);
+        }
+        catch (OperationCanceledException)
+        {
+            await SendCmdOutChunkedAsync(pc, id, "[cancelled]");
+        }
+        catch (Exception ex)
+        {
+            await SendCmdOutChunkedAsync(pc, id, "[error] " + ex.Message);
+        }
+        finally
+        {
+            if (RunningCmd.TryRemove(id, out var old))
+                old.Dispose();
+
+            await SafeWriteAsync(pc, $"CMDEND {id}");
+        }
+    }
+
+    static void HandleCmdAck(PeerConn pc, string line)
+    {
+        // CMDACK <id> OK|NO
+        var parts = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3) return;
+
+        var id = parts[1];
+        var ok = parts[2].Equals("OK", StringComparison.OrdinalIgnoreCase);
+
+        if (PendingCmd.TryGetValue(id, out var req))
+        {
+            Console.WriteLine(ok
+                ? $"[CMD] accepted by {pc.Name} id={id}: {req.CmdLine}"
+                : $"[CMD] denied by {pc.Name} id={id}: {req.CmdLine}");
+
+            if (!ok) PendingCmd.TryRemove(id, out _);
+        }
+        else
+        {
+            Console.WriteLine($"[CMD] ack from {pc.Name}: id={id} {(ok ? "OK" : "NO")}");
+        }
+    }
+
+    static void HandleCmdOut(PeerConn pc, string line)
+    {
+        // CMDOUT <id> <b64(chunk)>
+        var parts = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 3) return;
+
+        var id = parts[1];
+        string text;
+        try { text = FromB64(parts[2]); }
+        catch { text = "[invalid output chunk]"; }
+
+        Console.WriteLine($"[CMDOUT {pc.Name} id={id}] {text}");
+    }
+
+    static void HandleCmdEnd(PeerConn pc, string line)
+    {
+        // CMDEND <id>
+        var parts = line.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2) return;
+
+        var id = parts[1];
+
+        // if we are executing, cancel
+        if (RunningCmd.TryRemove(id, out var cts))
+        {
+            try { cts.Cancel(); } catch { }
+            cts.Dispose();
+            Console.WriteLine($"[CMD] cancelled by peer {pc.Name} id={id}");
+        }
+
+        if (PendingCmd.TryRemove(id, out var req))
+        {
+            Console.WriteLine($"[CMD] ended by {pc.Name} id={id} (cmd: {req.CmdLine})");
+        }
+        else
+        {
+            Console.WriteLine($"[CMD] end from {pc.Name} id={id}");
+        }
+    }
+
+    static async Task SafeWriteAsync(PeerConn pc, string line)
+    {
+        try { await pc.Writer.WriteLineAsync(line); } catch {  }
+    }
+
+    static async Task SendCmdOutChunkedAsync(PeerConn pc, string id, string output)
+    {
+        if (output.Length > 32_000) output = output.Substring(0, 32_000) + "\n[truncated]";
+
+        var bytes = Utf8NoBom.GetBytes(output);
+        const int chunk = 6000;
+
+        for (int i = 0; i < bytes.Length; i += chunk)
+        {
+            int n = Math.Min(chunk, bytes.Length - i);
+            var b64 = Convert.ToBase64String(bytes, i, n);
+            await SafeWriteAsync(pc, $"CMDOUT {id} {b64}");
+        }
+    }
+
+    static async Task<string> RunDiagAsync(string cmdLine, CancellationToken ct)
+    {
+        var parts = cmdLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var verb = parts[0].ToLowerInvariant();
+
+        switch (verb)
+        {
+            case "dns":
+                return await DiagDnsAsync(parts[1], ct);
+
+            case "ping":
+            {
+                var host = parts[1];
+                int count = 4;
+                if (parts.Length >= 3) int.TryParse(parts[2], out count);
+                if (count <= 0) count = 1;
+                if (count > 10) count = 10;
+                return await DiagPingAsync(host, count, ct);
+            }
+
+            case "tcp":
+            {
+                var host = parts[1];
+                int port = int.Parse(parts[2]);
+                return await DiagTcpAsync(host, port, ct);
+            }
+
+            case "http":
+                return await DiagHttpAsync(parts[1], ct);
+
+            case "trace":
+            {
+                var host = parts[1];
+                int maxHops = 20;
+                if (parts.Length >= 3) int.TryParse(parts[2], out maxHops);
+                if (maxHops <= 0) maxHops = 1;
+                if (maxHops > 40) maxHops = 40;
+                return await DiagTraceAsync(host, maxHops, ct);
+            }
+
+            case "ifaces":
+                return DiagIfaces();
+
+            default:
+                return "unknown diag command";
+        }
+    }
+
+    static async Task<string> DiagDnsAsync(string host, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        try
+        {
+            var addrs = await Dns.GetHostAddressesAsync(host);
+            var lines = addrs.Select(a => $"  {a}").ToArray();
+            return lines.Length == 0 ? "dns: no addresses" : "dns:\n" + string.Join("\n", lines);
+        }
+        catch (Exception ex)
+        {
+            return "dns error: " + ex.Message;
+        }
+    }
+
+    static async Task<string> DiagPingAsync(string host, int count, CancellationToken ct)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"ping {host} x{count}");
+
+        using var ping = new Ping();
+        for (int i = 1; i <= count; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var reply = await ping.SendPingAsync(host, 2000);
+                sb.AppendLine($"  {i}: {reply.Status} time={reply.RoundtripTime}ms addr={reply.Address}");
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine($"  {i}: error {ex.Message}");
+            }
+        }
+        return sb.ToString();
+    }
+
+    static async Task<string> DiagTcpAsync(string host, int port, CancellationToken ct)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using var c = new TcpClient();
+
+        var connectTask = c.ConnectAsync(host, port);
+        var timeoutTask = Task.Delay(4000, ct);
+
+        var done = await Task.WhenAny(connectTask, timeoutTask);
+        if (done == timeoutTask)
+            return $"tcp {host}:{port} timeout";
+
+        try
+        {
+            await connectTask;
+            sw.Stop();
+            return $"tcp {host}:{port} OK ({sw.ElapsedMilliseconds}ms)";
+        }
+        catch (Exception ex)
+        {
+            return $"tcp {host}:{port} FAIL ({ex.Message})";
+        }
+    }
+
+    static async Task<string> DiagHttpAsync(string url, CancellationToken ct)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return "http: invalid url";
+
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Head, uri);
+            using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"http HEAD {uri}");
+            sb.AppendLine($"status: {(int)resp.StatusCode} {resp.ReasonPhrase}");
+            sb.AppendLine($"final: {resp.RequestMessage?.RequestUri}");
+
+            foreach (var h in resp.Headers.Take(20))
+                sb.AppendLine($"{h.Key}: {string.Join(", ", h.Value)}");
+
+            if (resp.Content?.Headers != null)
+            {
+                foreach (var h in resp.Content.Headers.Take(20))
+                    sb.AppendLine($"{h.Key}: {string.Join(", ", h.Value)}");
+            }
+
+            return sb.ToString();
+        }
+        catch (HttpRequestException)
+        {
+            // fallback GET headers only
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, uri);
+                using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"http GET {uri}");
+                sb.AppendLine($"status: {(int)resp.StatusCode} {resp.ReasonPhrase}");
+                sb.AppendLine($"final: {resp.RequestMessage?.RequestUri}");
+                foreach (var h in resp.Headers.Take(20))
+                    sb.AppendLine($"{h.Key}: {string.Join(", ", h.Value)}");
+                return sb.ToString();
+            }
+            catch (Exception ex2)
+            {
+                return "http error: " + ex2.Message;
+            }
+        }
+        catch (Exception ex)
+        {
+            return "http error: " + ex.Message;
+        }
+    }
+
+    static async Task<string> DiagTraceAsync(string host, int maxHops, CancellationToken ct)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"trace {host} maxHops={maxHops}");
+
+        using var ping = new Ping();
+        byte[] buffer = new byte[32];
+
+        for (int ttl = 1; ttl <= maxHops; ttl++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            PingReply reply;
+            try
+            {
+                var opt = new PingOptions(ttl, true);
+                reply = await ping.SendPingAsync(host, 2500, buffer, opt);
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine($"{ttl,2}: error {ex.Message}");
+                continue;
+            }
+
+            var addr = reply.Address?.ToString() ?? "*";
+            sb.AppendLine($"{ttl,2}: {reply.Status} {addr} time={reply.RoundtripTime}ms");
+
+            if (reply.Status == IPStatus.Success)
+                break;
+        }
+
+        return sb.ToString();
+    }
+
+    static string DiagIfaces()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("ifaces:");
+
+        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            sb.AppendLine($"- {ni.Name} ({ni.NetworkInterfaceType}) {ni.OperationalStatus}");
+            try
+            {
+                var ip = ni.GetIPProperties();
+                foreach (var ua in ip.UnicastAddresses)
+                    sb.AppendLine($"    ip: {ua.Address}");
+                foreach (var g in ip.GatewayAddresses)
+                    sb.AppendLine($"    gw: {g.Address}");
+                foreach (var d in ip.DnsAddresses)
+                    sb.AppendLine($"    dns: {d}");
+            }
+            catch {  }
+        }
+
+        return sb.ToString();
     }
 
     // ================= FILE TRANSFER (separate connection) =================
@@ -938,8 +1452,6 @@ class Program2
             await WriteLineAsync(ns, $"FILESIZE {size}");
 
             var resp = await ReadLineAsync(ns);
-            // Debug: wenn hier "HELLO ..." kommt, dann läuft beim Empfänger noch der falsche Accept-Loop!
-            // Console.WriteLine($"[FILE] receiver replied: '{resp}'");
 
             if (!string.Equals(resp, "OK", StringComparison.OrdinalIgnoreCase))
             {
