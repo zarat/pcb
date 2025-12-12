@@ -1260,6 +1260,8 @@ class Program2
 
     static async Task<string> RunDiagAsync(string cmdLine, CancellationToken ct)
     {
+		
+		
         var parts = cmdLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var verb = parts[0].ToLowerInvariant();
 
@@ -1304,6 +1306,7 @@ class Program2
             default:
                 return DiagIfaces1(parts[0]); //"unknown diag command";
         }
+		
     }
 
     static async Task<string> DiagDnsAsync(string host, CancellationToken ct)
