@@ -9,23 +9,60 @@ using System.Threading.Tasks;
 
 public class Program
 {
-
     public static async Task Main(string[] args)
     {
-
-        switch(args[0])
+        if (args.Length == 0)
         {
-            case "server":
-                await Program1.RunAsync(new[] { args[1] });
-                break;
-            case "client":
-                await Program2.RunAsync(new[] { args[1], args[2], args[3] });
-                break;
-            default: break;
+            PrintUsage();
+            return;
         }
 
+        switch (args[0].ToLowerInvariant())
+        {
+            case "server":
+                {
+                    if (args.Length < 2) { PrintUsage(); return; }
+                    await Program1.RunAsync(new[] { args[1] });
+                    break;
+                }
+
+            case "client":
+                {
+                    // online: client <server_ip> <server_port> <my_p2p_port>
+                    // offline: client <my_p2p_port>
+                    if (args.Length == 2)
+                    {
+                        await Program2.RunAsync(new[] { args[1] }); // offline
+                    }
+                    else if (args.Length >= 4)
+                    {
+                        await Program2.RunAsync(new[] { args[1], args[2], args[3] }); // online (mit fallback)
+                    }
+                    else
+                    {
+                        PrintUsage();
+                    }
+                    break;
+                }
+
+            default:
+                PrintUsage();
+                break;
+        }
     }
 
+    static void PrintUsage()
+    {
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  app server <port>");
+        Console.WriteLine("  app client <server_ip> <server_port> <my_p2p_port>");
+        Console.WriteLine("  app client <my_p2p_port>                (offline P2P only)");
+        Console.WriteLine();
+        Console.WriteLine("Examples:");
+        Console.WriteLine("  app server 27015");
+        Console.WriteLine("  app client 127.0.0.1 27015 27016");
+        Console.WriteLine("  app client 27016");
+    }
 }
 
 sealed class ClientState
@@ -59,7 +96,12 @@ class Program1
             return;
         }
 
-        int port = int.Parse(args[0]);
+        if (!int.TryParse(args[0], out int port) || port <= 0 || port > 65535)
+        {
+            Console.WriteLine("Invalid port.");
+            return;
+        }
+
         var listener = new TcpListener(IPAddress.Any, port);
         listener.Start();
         Console.WriteLine($"Chat-Server gestartet auf Port {port}");
@@ -162,13 +204,18 @@ sealed class PeerConn
     public StreamWriter Writer { get; }
     public string Name { get; set; }
 
-    public PeerConn(TcpClient c, string name)
+    public IPAddress Ip { get; }
+    public int ListenPort { get; set; }   // <- neu: Port, auf dem Peer P2P annimmt
+
+    public PeerConn(TcpClient c, string name, IPAddress ip, int listenPort)
     {
         Client = c;
         var ns = c.GetStream();
         Reader = new StreamReader(ns, Encoding.UTF8, leaveOpen: true);
         Writer = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
         Name = name;
+        Ip = ip;
+        ListenPort = listenPort;
     }
 
     public void Close()
@@ -189,59 +236,88 @@ class Program2
         new ConcurrentDictionary<string, Offer>(StringComparer.OrdinalIgnoreCase);
 
     static string MyName = "anon";
+    static int MyP2pPort;
+
+    static volatile bool ServerOnline = false;
+    static TcpClient? ServerClient;
+    static StreamReader? ServerReader;
+    static StreamWriter? ServerWriter;
 
     public static async Task RunAsync(string[] args)
     {
-        if (args.Length < 3)
+        // offline: [my_p2p_port]
+        // online : [server_ip, server_port, my_p2p_port]
+        string? serverIp = null;
+        int serverPort = 0;
+
+        if (args.Length == 1)
         {
-            Console.WriteLine("Usage: Client <server_ip> <server_port> <my_p2p_port>");
+            if (!int.TryParse(args[0], out MyP2pPort) || MyP2pPort <= 0 || MyP2pPort > 65535)
+            {
+                Console.WriteLine("Invalid P2P port.");
+                return;
+            }
+        }
+        else if (args.Length >= 3)
+        {
+            serverIp = args[0];
+            if (!int.TryParse(args[1], out serverPort) || serverPort <= 0 || serverPort > 65535)
+            {
+                Console.WriteLine("Invalid server port.");
+                return;
+            }
+            if (!int.TryParse(args[2], out MyP2pPort) || MyP2pPort <= 0 || MyP2pPort > 65535)
+            {
+                Console.WriteLine("Invalid P2P port.");
+                return;
+            }
+        }
+        else
+        {
+            Console.WriteLine("Usage:");
+            Console.WriteLine("  Client <server_ip> <server_port> <my_p2p_port>");
+            Console.WriteLine("  Client <my_p2p_port>   (offline P2P only)");
             return;
         }
 
-        string serverIp = args[0];
-        int serverPort = int.Parse(args[1]);
-        int myP2pPort = int.Parse(args[2]);
+        // P2P listener immer starten
+        var p2pListener = new TcpListener(IPAddress.Any, MyP2pPort);
+        p2pListener.Start();
+        _ = Task.Run(() => AcceptIncomingLoopAsync(p2pListener));
+        Console.WriteLine($"[P2P] listening on 0.0.0.0:{MyP2pPort}");
 
-        var server = new TcpClient();
-        await server.ConnectAsync(IPAddress.Parse(serverIp), serverPort);
-
-        var serverNs = server.GetStream();
-        var serverReader = new StreamReader(serverNs, Encoding.UTF8, leaveOpen: true);
-        var serverWriter = new StreamWriter(serverNs, Encoding.UTF8) { AutoFlush = true };
-
-        Console.WriteLine("Verbunden mit dem Chat-Server");
-
-        var prompt = await serverReader.ReadLineAsync();
-        if (prompt != null) Console.WriteLine($"<SERVER> {prompt}");
-
+        // Username
+        Console.Write("Username: ");
         MyName = (Console.ReadLine() ?? "anon").Trim();
         if (MyName.Length == 0) MyName = "anon";
-        await serverWriter.WriteLineAsync(MyName);
 
-        // P2P listener (für incoming)
-        var p2pListener = new TcpListener(IPAddress.Any, myP2pPort);
-        p2pListener.Start();
-        _ = Task.Run(() => AcceptPeersLoopAsync(p2pListener));
+        // optional: direkt beim Start zum Server
+        if (serverIp != null)
+            await TryConnectServerAsync(serverIp, serverPort);
 
-        // Server recv loop
-        _ = Task.Run(() => ServerRecvLoopAsync(serverReader));
+        if (!ServerOnline)
+        {
+            if (serverIp != null)
+                Console.WriteLine("[INFO] OFFLINE-P2P Modus aktiv (Server nicht verbunden).");
+            else
+                Console.WriteLine("[INFO] OFFLINE-P2P Modus (kein Server angegeben).");
+        }
 
-        Console.WriteLine("Commands:");
-        Console.WriteLine("  #invite <user> <port>   (P2P Offer senden)");
-        Console.WriteLine("  /offers                 (eingehende Offers anzeigen)");
-        Console.WriteLine("  /accept <user>          (Offer annehmen -> P2P verbinden)");
-        Console.WriteLine("  /deny <user>            (Offer ablehnen)");
-        Console.WriteLine("  /p <peer> <text>        (P2P Nachricht)");
-        Console.WriteLine("  /plist                  (aktive Peers)");
-        Console.WriteLine("  /pclose <peer>          (Peer schließen)");
-        Console.WriteLine("  /pcloseall              (alle schließen)");
+        PrintHelp();
 
         while (true)
         {
             var raw = Console.ReadLine();
             if (raw == null) break;
 
-            var line = raw.Trim(); // wichtig: führende Spaces weg
+            var line = raw.Trim();
+            if (line.Length == 0) continue;
+
+            if (line.Equals("/help", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintHelp();
+                continue;
+            }
 
             if (line.Equals("/plist", StringComparison.OrdinalIgnoreCase))
             {
@@ -296,6 +372,29 @@ class Program2
                 continue;
             }
 
+            if (line.StartsWith("/connect ", StringComparison.OrdinalIgnoreCase))
+            {
+                // /connect <ip> <port> [name]
+                var p = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length < 3 || !int.TryParse(p[2], out int port) || port <= 0 || port > 65535)
+                {
+                    Console.WriteLine("[P2P] Usage: /connect <ip> <port> [name]");
+                    continue;
+                }
+
+                string ip = p[1];
+                string suggestedName = p.Length >= 4 ? p[3] : ip;
+
+                if (Peers.ContainsKey(suggestedName))
+                {
+                    Console.WriteLine($"[P2P] already connected as '{suggestedName}' (try different name or close first)");
+                    continue;
+                }
+
+                _ = Task.Run(() => ConnectToPeerAsync(suggestedName, ip, port));
+                continue;
+            }
+
             if (line.StartsWith("/p ", StringComparison.OrdinalIgnoreCase))
             {
                 var rest = line.Substring(3);
@@ -311,10 +410,197 @@ class Program2
                 continue;
             }
 
-            // default -> server
-            await serverWriter.WriteLineAsync(line);
+            // ---- FILE SEND (via existing peer) ----
+            if (line.StartsWith("/fsend ", StringComparison.OrdinalIgnoreCase))
+            {
+                // /fsend <peer> <filepath>
+                var p = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length < 3)
+                {
+                    Console.WriteLine("[FILE] Usage: /fsend <peer> <filepath>");
+                    continue;
+                }
+
+                var peer = p[1];
+                var path = p[2].Trim('"');
+
+                if (!Peers.TryGetValue(peer, out var pc))
+                {
+                    Console.WriteLine($"[FILE] unknown peer '{peer}'");
+                    continue;
+                }
+                if (pc.ListenPort <= 0)
+                {
+                    Console.WriteLine($"[FILE] peer '{peer}' has no listen port info (reconnect needed).");
+                    continue;
+                }
+
+                _ = Task.Run(() => SendFileToAsync(pc.Ip.ToString(), pc.ListenPort, path));
+                continue;
+            }
+
+            // ---- FILE SEND (direct ip/port) ----
+            if (line.StartsWith("/fsendip ", StringComparison.OrdinalIgnoreCase))
+            {
+                // /fsendip <ip> <port> <filepath>
+                var p = line.Split(' ', 4, StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length < 4 || !int.TryParse(p[2], out int port) || port <= 0 || port > 65535)
+                {
+                    Console.WriteLine("[FILE] Usage: /fsendip <ip> <port> <filepath>");
+                    continue;
+                }
+                var ip = p[1];
+                var path = p[3].Trim('"');
+                _ = Task.Run(() => SendFileToAsync(ip, port, path));
+                continue;
+            }
+
+            // ---- SERVER connect/disconnect while running ----
+            if (line.StartsWith("/sconnect ", StringComparison.OrdinalIgnoreCase))
+            {
+                var p = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length != 3 || !int.TryParse(p[2], out int sp) || sp <= 0 || sp > 65535)
+                {
+                    Console.WriteLine("[SERVER] Usage: /sconnect <ip> <port>");
+                    continue;
+                }
+                await TryConnectServerAsync(p[1], sp);
+                continue;
+            }
+
+            if (line.Equals("/sdisconnect", StringComparison.OrdinalIgnoreCase))
+            {
+                DisconnectServer("[SERVER] disconnected by user.");
+                continue;
+            }
+
+            // default -> server (nur wenn online)
+            if (ServerOnline && ServerWriter != null)
+            {
+                try
+                {
+                    await ServerWriter.WriteLineAsync(line);
+                }
+                catch
+                {
+                    DisconnectServer("[WARN] Server connection lost. OFFLINE-P2P Modus aktiv.");
+                }
+            }
+            else
+            {
+                if (line.StartsWith("#invite", StringComparison.OrdinalIgnoreCase))
+                    Console.WriteLine("[WARN] #invite geht nur mit Server. Offline: /connect <ip> <port> [name]");
+                else
+                    Console.WriteLine("[INFO] Kein Server verbunden. Nutze /connect oder /p (oder /help).");
+            }
         }
     }
+
+    static void PrintHelp()
+    {
+        Console.WriteLine("Commands:");
+        Console.WriteLine("  #invite <user> <port>               (nur wenn Server online)");
+        Console.WriteLine("  #userlist                           (nur wenn Server online)");
+        Console.WriteLine("  /sconnect <ip> <port>               (Server verbinden während Laufzeit)");
+        Console.WriteLine("  /sdisconnect                        (Serversession beenden)");
+        Console.WriteLine("  /connect <ip> <port> [name]         (direkt P2P verbinden, offline/online)");
+        Console.WriteLine("  /offers                             (eingehende Offers anzeigen)");
+        Console.WriteLine("  /accept <user>                      (Offer annehmen -> P2P verbinden)");
+        Console.WriteLine("  /deny <user>                        (Offer ablehnen)");
+        Console.WriteLine("  /p <peer> <text>                    (P2P Nachricht)");
+        Console.WriteLine("  /fsend <peer> <filepath>            (Datei an Peer senden)");
+        Console.WriteLine("  /fsendip <ip> <port> <filepath>     (Datei direkt an IP/Port senden)");
+        Console.WriteLine("  /plist                              (aktive Peers)");
+        Console.WriteLine("  /pclose <peer>                      (Peer schließen)");
+        Console.WriteLine("  /pcloseall                          (alle schließen)");
+        Console.WriteLine("  /help");
+    }
+
+    // ---------------- SERVER CONNECT/DISCONNECT ----------------
+
+    static async Task TryConnectServerAsync(string serverIp, int serverPort)
+    {
+        if (ServerOnline)
+        {
+            Console.WriteLine("[SERVER] already connected.");
+            return;
+        }
+
+        try
+        {
+            ServerClient = new TcpClient();
+            await ServerClient.ConnectAsync(IPAddress.Parse(serverIp), serverPort);
+
+            var ns = ServerClient.GetStream();
+            ServerReader = new StreamReader(ns, Encoding.UTF8, leaveOpen: true);
+            ServerWriter = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
+
+            // server prompt
+            var prompt = await ServerReader.ReadLineAsync();
+            if (prompt != null) Console.WriteLine($"<SERVER> {prompt}");
+
+            await ServerWriter.WriteLineAsync(MyName);
+
+            ServerOnline = true;
+            Console.WriteLine("[SERVER] connected.");
+
+            _ = Task.Run(() => ServerRecvLoopAsync());
+        }
+        catch (Exception ex)
+        {
+            DisconnectServer($"[WARN] Server nicht erreichbar ({ex.Message}). OFFLINE-P2P Modus aktiv.");
+        }
+    }
+
+    static void DisconnectServer(string msg)
+    {
+        Console.WriteLine(msg);
+        ServerOnline = false;
+        try { ServerClient?.Close(); } catch { }
+        ServerClient = null;
+        ServerReader = null;
+        ServerWriter = null;
+    }
+
+    static async Task ServerRecvLoopAsync()
+    {
+        try
+        {
+            if (ServerReader == null) return;
+
+            while (true)
+            {
+                var line = await ServerReader.ReadLineAsync();
+                if (line == null) break;
+
+                line = line.TrimEnd('\r', '\n');
+
+                if (line.StartsWith("#p2p_offer ", StringComparison.Ordinal))
+                {
+                    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length == 4 && int.TryParse(parts[3], out int port))
+                    {
+                        string peerName = parts[1];
+                        string ip = parts[2];
+
+                        var offer = new Offer(peerName, ip, port, DateTime.Now);
+                        Offers[peerName] = offer;
+
+                        Console.WriteLine($"[P2P] offer from {peerName} -> {ip}:{port}");
+                        Console.WriteLine($"      type: /accept {peerName}  or  /deny {peerName}");
+                        continue;
+                    }
+                }
+
+                Console.WriteLine("<SERVER> " + line);
+            }
+        }
+        catch { }
+
+        DisconnectServer("[WARN] Verbindung zum Server getrennt. OFFLINE-P2P Modus aktiv.");
+    }
+
+    // ---------------- P2P / OFFERS ----------------
 
     static void PrintPeers()
     {
@@ -381,43 +667,9 @@ class Program2
         }
     }
 
-    static async Task ServerRecvLoopAsync(StreamReader serverReader)
-    {
-        try
-        {
-            while (true)
-            {
-                var line = await serverReader.ReadLineAsync();
-                if (line == null) break;
+    // ---------------- INCOMING CONNECTION MULTIPLEX (CHAT vs FILE) ----------------
 
-                line = line.TrimEnd('\r', '\n');
-
-                if (line.StartsWith("#p2p_offer ", StringComparison.Ordinal))
-                {
-                    // "#p2p_offer <peerName> <ip> <port>"
-                    var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length == 4 && int.TryParse(parts[3], out int port))
-                    {
-                        string peerName = parts[1];
-                        string ip = parts[2];
-
-                        var offer = new Offer(peerName, ip, port, DateTime.Now);
-                        Offers[peerName] = offer;
-
-                        Console.WriteLine($"[P2P] offer from {peerName} -> {ip}:{port}");
-                        Console.WriteLine($"      type: /accept {peerName}  or  /deny {peerName}");
-                        continue;
-                    }
-                }
-
-                Console.WriteLine("<SERVER> " + line);
-            }
-        }
-        catch { }
-        Console.WriteLine("Verbindung zum Server getrennt");
-    }
-
-    static async Task AcceptPeersLoopAsync(TcpListener listener)
+    static async Task AcceptIncomingLoopAsync(TcpListener listener)
     {
         while (true)
         {
@@ -425,33 +677,64 @@ class Program2
             try { c = await listener.AcceptTcpClientAsync(); }
             catch { break; }
 
-            _ = Task.Run(() => HandleIncomingPeerAsync(c));
+            _ = Task.Run(() => HandleIncomingConnectionAsync(c));
         }
     }
 
-    static async Task HandleIncomingPeerAsync(TcpClient c)
+    static async Task HandleIncomingConnectionAsync(TcpClient c)
+    {
+        try
+        {
+            var ns = c.GetStream();
+
+            // erste Zeile lesen (ohne StreamReader-Pufferprobleme)
+            var first = await ReadLineAsync(ns);
+            if (first == null) { c.Close(); return; }
+
+            if (first.StartsWith("FILEHELLO ", StringComparison.OrdinalIgnoreCase))
+            {
+                var sender = first.Substring(9).Trim();
+                if (sender.Length == 0) sender = "peer";
+                await HandleIncomingFileAsync(c, sender);
+                return;
+            }
+
+            // default: Chat-P2P
+            await HandleIncomingPeerAsync(c, first);
+        }
+        catch
+        {
+            try { c.Close(); } catch { }
+        }
+    }
+
+    static async Task HandleIncomingPeerAsync(TcpClient c, string helloLineAlreadyRead)
     {
         PeerConn? pc = null;
         try
         {
+            var remoteIp = ((IPEndPoint)c.Client.RemoteEndPoint!).Address;
+
+            // helloLineAlreadyRead == "HELLO <name> <port>"
+            var (peerName, peerPort) = ParseHello(helloLineAlreadyRead);
+            peerName ??= "peer";
+
+            // send back HELLO <me> <myPort>
             var ns = c.GetStream();
-            var r = new StreamReader(ns, Encoding.UTF8, leaveOpen: true);
-            var w = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
+            await WriteLineAsync(ns, $"HELLO {MyName} {MyP2pPort}");
 
-            // expect HELLO <name>
-            var hello = await r.ReadLineAsync();
-            var peerName = ParseHelloName(hello) ?? "peer";
+            pc = new PeerConn(c, peerName, remoteIp, peerPort);
 
-            // send back HELLO <me>
-            await w.WriteLineAsync($"HELLO {MyName}");
+            if (!Peers.TryAdd(peerName, pc))
+            {
+                await WriteLineAsync(ns, "BYE");
+                pc.Close();
+                Console.WriteLine($"[P2P] incoming '{peerName}' rejected (name already connected)");
+                return;
+            }
 
-            pc = new PeerConn(c, peerName);
-            Peers[peerName] = pc;
-
-            // offer kann weg, falls noch vorhanden
             Offers.TryRemove(peerName, out _);
-
-            Console.WriteLine($"[P2P] incoming connection from {peerName}");
+            Console.WriteLine($"[P2P] incoming connection from {peerName} ({remoteIp}) listenPort={peerPort}");
 
             await PeerRecvLoopAsync(pc);
         }
@@ -461,34 +744,43 @@ class Program2
         }
     }
 
-    static async Task ConnectToPeerAsync(string peerNameFromOffer, string ip, int port)
+    static async Task ConnectToPeerAsync(string peerNameFromOfferOrSuggested, string ip, int port)
     {
         try
         {
             var c = new TcpClient();
             await c.ConnectAsync(IPAddress.Parse(ip), port);
 
+            var remoteIp = IPAddress.Parse(ip);
+
             var ns = c.GetStream();
-            var r = new StreamReader(ns, Encoding.UTF8, leaveOpen: true);
-            var w = new StreamWriter(ns, Encoding.UTF8) { AutoFlush = true };
 
-            // send HELLO <me>
-            await w.WriteLineAsync($"HELLO {MyName}");
+            // send HELLO <me> <myPort>
+            await WriteLineAsync(ns, $"HELLO {MyName} {MyP2pPort}");
 
-            // expect HELLO <peer>
-            var back = await r.ReadLineAsync();
-            var realName = ParseHelloName(back) ?? peerNameFromOffer;
+            // expect HELLO <peer> <peerPort>
+            var back = await ReadLineAsync(ns);
+            var (realName, peerListenPort) = ParseHello(back);
+            realName ??= peerNameFromOfferOrSuggested;
 
-            var pc = new PeerConn(c, realName);
-            Peers[realName] = pc;
+            var pc = new PeerConn(c, realName, remoteIp, peerListenPort <= 0 ? port : peerListenPort);
 
-            Console.WriteLine($"[P2P] connected to {realName} at {ip}:{port}");
+            if (!Peers.TryAdd(realName, pc))
+            {
+                try { await WriteLineAsync(ns, "BYE"); } catch { }
+                pc.Close();
+                Console.WriteLine($"[P2P] connect ok but name '{realName}' already exists -> closed");
+                return;
+            }
 
+            Offers.TryRemove(realName, out _);
+
+            Console.WriteLine($"[P2P] connected to {realName} at {ip}:{port} listenPort={pc.ListenPort}");
             await PeerRecvLoopAsync(pc);
         }
-        catch
+        catch (Exception ex)
         {
-            Console.WriteLine($"[P2P] connect failed to {ip}:{port}");
+            Console.WriteLine($"[P2P] connect failed to {ip}:{port} ({ex.Message})");
         }
     }
 
@@ -519,15 +811,210 @@ class Program2
         }
     }
 
-    static string? ParseHelloName(string? line)
+    static (string? Name, int Port) ParseHello(string? line)
     {
-        if (line == null) return null;
+        if (string.IsNullOrWhiteSpace(line)) return (null, 0);
         line = line.Trim();
-        if (line.StartsWith("HELLO ", StringComparison.OrdinalIgnoreCase))
+
+        if (!line.StartsWith("HELLO ", StringComparison.OrdinalIgnoreCase))
+            return (null, 0);
+
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        // HELLO <name> [port]
+        if (parts.Length >= 2)
         {
-            var name = line.Substring(6).Trim();
-            return name.Length > 0 ? name : null;
+            var name = parts[1].Trim();
+            int port = 0;
+            if (parts.Length >= 3) int.TryParse(parts[2], out port);
+            return (name.Length > 0 ? name : null, port);
         }
-        return null;
+        return (null, 0);
+    }
+
+    // ---------------- FILE TRANSFER (separate connection) ----------------
+    // Protocol:
+    // Sender -> receiver:
+    //   FILEHELLO <senderName>\n
+    //   FILENAME <base64>\n
+    //   FILESIZE <bytes>\n
+    // Receiver -> sender:
+    //   OK\n   (or NO\n)
+    // Then sender streams <bytes> raw
+    // Connection closes.
+
+    static async Task SendFileToAsync(string ip, int port, string filePath)
+    {
+        try
+        {
+            if (!File.Exists(filePath))
+            {
+                Console.WriteLine($"[FILE] not found: {filePath}");
+                return;
+            }
+
+            var fi = new FileInfo(filePath);
+            var fileName = fi.Name;
+            long size = fi.Length;
+
+            // optional: simple guard
+            if (size < 0)
+            {
+                Console.WriteLine("[FILE] invalid file size.");
+                return;
+            }
+
+            var c = new TcpClient();
+            await c.ConnectAsync(IPAddress.Parse(ip), port);
+            var ns = c.GetStream();
+
+            await WriteLineAsync(ns, $"FILEHELLO {MyName}");
+            await WriteLineAsync(ns, $"FILENAME {Convert.ToBase64String(Encoding.UTF8.GetBytes(fileName))}");
+            await WriteLineAsync(ns, $"FILESIZE {size}");
+
+            var resp = await ReadLineAsync(ns);
+            if (!string.Equals(resp, "OK", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine($"[FILE] rejected by receiver ({resp ?? "no response"})");
+                c.Close();
+                return;
+            }
+
+            Console.WriteLine($"[FILE] sending '{fileName}' ({size} bytes) -> {ip}:{port}");
+
+            using (var fs = File.OpenRead(filePath))
+            {
+                await fs.CopyToAsync(ns);
+                await ns.FlushAsync();
+            }
+
+            Console.WriteLine("[FILE] send complete.");
+            c.Close();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FILE] send failed ({ex.Message})");
+        }
+    }
+
+    static async Task HandleIncomingFileAsync(TcpClient c, string senderName)
+    {
+        try
+        {
+            var ns = c.GetStream();
+
+            var fnLine = await ReadLineAsync(ns);     // FILENAME ...
+            var szLine = await ReadLineAsync(ns);     // FILESIZE ...
+
+            string fileName = "file.bin";
+            long size = 0;
+
+            if (fnLine != null && fnLine.StartsWith("FILENAME ", StringComparison.OrdinalIgnoreCase))
+            {
+                var b64 = fnLine.Substring(9).Trim();
+                try
+                {
+                    fileName = Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+                    if (string.IsNullOrWhiteSpace(fileName)) fileName = "file.bin";
+                    fileName = Path.GetFileName(fileName); // sanitize
+                }
+                catch { fileName = "file.bin"; }
+            }
+
+            if (szLine != null && szLine.StartsWith("FILESIZE ", StringComparison.OrdinalIgnoreCase))
+            {
+                long.TryParse(szLine.Substring(9).Trim(), out size);
+            }
+
+            if (size < 0)
+            {
+                await WriteLineAsync(ns, "NO");
+                c.Close();
+                return;
+            }
+
+            Directory.CreateDirectory("downloads");
+            var target = MakeUniquePath(Path.Combine("downloads", fileName));
+
+            // Auto-accept (kein Console-Prompt in background tasks!)
+            await WriteLineAsync(ns, "OK");
+
+            Console.WriteLine($"[FILE] incoming from {senderName}: '{fileName}' ({size} bytes) -> {target}");
+
+            using (var fs = File.Create(target))
+            {
+                await CopyExactAsync(ns, fs, size);
+            }
+
+            Console.WriteLine($"[FILE] received complete: {target}");
+            c.Close();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[FILE] receive failed ({ex.Message})");
+            try { c.Close(); } catch { }
+        }
+    }
+
+    static string MakeUniquePath(string path)
+    {
+        if (!File.Exists(path)) return path;
+
+        var dir = Path.GetDirectoryName(path) ?? ".";
+        var name = Path.GetFileNameWithoutExtension(path);
+        var ext = Path.GetExtension(path);
+
+        for (int i = 1; i < 10000; i++)
+        {
+            var p = Path.Combine(dir, $"{name}({i}){ext}");
+            if (!File.Exists(p)) return p;
+        }
+        return Path.Combine(dir, $"{name}({Guid.NewGuid():N}){ext}");
+    }
+
+    static async Task CopyExactAsync(Stream input, Stream output, long bytes)
+    {
+        byte[] buf = new byte[64 * 1024];
+        long remaining = bytes;
+
+        while (remaining > 0)
+        {
+            int toRead = remaining > buf.Length ? buf.Length : (int)remaining;
+            int n = await input.ReadAsync(buf, 0, toRead);
+            if (n <= 0) throw new EndOfStreamException("unexpected EOF during file transfer");
+            await output.WriteAsync(buf, 0, n);
+            remaining -= n;
+        }
+        await output.FlushAsync();
+    }
+
+    static async Task<string?> ReadLineAsync(NetworkStream ns, int max = 16_384)
+    {
+        var ms = new MemoryStream();
+        byte[] b = new byte[1];
+
+        while (ms.Length < max)
+        {
+            int n = await ns.ReadAsync(b, 0, 1);
+            if (n <= 0)
+            {
+                if (ms.Length == 0) return null;
+                break;
+            }
+
+            if (b[0] == (byte)'\n')
+                break;
+
+            if (b[0] != (byte)'\r')
+                ms.WriteByte(b[0]);
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    static async Task WriteLineAsync(NetworkStream ns, string line)
+    {
+        var bytes = Encoding.UTF8.GetBytes(line + "\n");
+        await ns.WriteAsync(bytes, 0, bytes.Length);
+        await ns.FlushAsync();
     }
 }
