@@ -9,6 +9,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 
 public class Program
 {
@@ -39,7 +40,7 @@ public class Program
                 }
                 else if (args.Length >= 4)
                 {
-                    await Program2.RunAsync(new[] { args[1], args[2], args[3] }); // online (mit fallback)
+                    await Program2.RunAsync(new[] { args[1], args[2], args[3] }); // online
                 }
                 else
                 {
@@ -256,14 +257,16 @@ class Program2
     static StreamReader? ServerReader;
     static StreamWriter? ServerWriter;
 
-    // ===================== /cmd support (SAFE built-in diagnostics) =====================
-    // Protocol over existing peer text stream:
+    // ===================== Remote-DIAG (/cmd) =====================
+    // Protocol over peer stream:
     //   CMDREQ <id> <b64(cmdline)>
     //   CMDACK <id> OK|NO
     //   CMDOUT <id> <b64(chunk)>
     //   CMDEND <id>
-    sealed record CmdReq(string Id, string Peer, string CmdLine, DateTime SentAt);
-    static readonly ConcurrentDictionary<string, CmdReq> PendingCmd = new(StringComparer.OrdinalIgnoreCase);
+
+    sealed record CmdReq(string Id, string Peer, string CmdLine, DateTime At);
+    static readonly ConcurrentDictionary<string, CmdReq> OutgoingCmd = new(StringComparer.OrdinalIgnoreCase);
+    static readonly ConcurrentDictionary<string, CmdReq> IncomingCmd = new(StringComparer.OrdinalIgnoreCase);
     static readonly ConcurrentDictionary<string, CancellationTokenSource> RunningCmd = new(StringComparer.OrdinalIgnoreCase);
 
     static readonly HttpClient Http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = true })
@@ -349,6 +352,12 @@ class Program2
             if (line.Equals("/offers", StringComparison.OrdinalIgnoreCase)) { PrintOffers(); continue; }
             if (line.Equals("/pcloseall", StringComparison.OrdinalIgnoreCase)) { CloseAllPeers(); continue; }
 
+            if (line.Equals("/cmdpending", StringComparison.OrdinalIgnoreCase))
+            {
+                PrintCmdPending();
+                continue;
+            }
+
             if (line.StartsWith("/pclose ", StringComparison.OrdinalIgnoreCase))
             {
                 var peer = line.Substring(8).Trim();
@@ -411,11 +420,11 @@ class Program2
             // Offline Offer (Empfänger muss /accept machen)
             if (line.StartsWith("/poffer ", StringComparison.OrdinalIgnoreCase))
             {
-                // /poffer <ip> <port> [name]
+                // /poffer <ip> <port>
                 var p = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                 if (p.Length < 3 || !int.TryParse(p[2], out int port) || port <= 0 || port > 65535)
                 {
-                    Console.WriteLine("[P2P] Usage: /poffer <ip> <port> [name]");
+                    Console.WriteLine("[P2P] Usage: /poffer <ip> <port>");
                     continue;
                 }
 
@@ -424,17 +433,7 @@ class Program2
                 continue;
             }
 
-            // --------- NEW: /cmd and /cmdend ----------
-            if (line.StartsWith("/cmdend ", StringComparison.OrdinalIgnoreCase))
-            {
-                // /cmdend <peer> <id>
-                var p = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
-                if (p.Length < 3) { Console.WriteLine("[CMD] Usage: /cmdend <peer> <id>"); continue; }
-                await SendToPeer(p[1], $"CMDEND {p[2]}");
-                Console.WriteLine($"[CMD] end sent to {p[1]} id={p[2]}");
-                continue;
-            }
-
+            // -------- /cmd: request diag on peer (peer must confirm via /cmdallow) --------
             if (line.StartsWith("/cmd ", StringComparison.OrdinalIgnoreCase))
             {
                 // /cmd <peer> <cmdline>
@@ -442,13 +441,7 @@ class Program2
                 if (p.Length < 3)
                 {
                     Console.WriteLine("[CMD] Usage: /cmd <peer> <cmdline>");
-                    Console.WriteLine("[CMD] cmdline examples:");
-                    Console.WriteLine("      dns example.com");
-                    Console.WriteLine("      ping example.com 4");
-                    Console.WriteLine("      tcp example.com 443");
-                    Console.WriteLine("      http https://example.com");
-                    Console.WriteLine("      trace example.com 20");
-                    Console.WriteLine("      ifaces");
+                    Console.WriteLine("[CMD] cmdline: dns|ping|tcp|http|trace|ifaces");
                     continue;
                 }
 
@@ -461,20 +454,79 @@ class Program2
                     continue;
                 }
 
+				/*
                 if (!IsSupportedDiagCommand(cmdLine, out var why))
                 {
                     Console.WriteLine($"[CMD] blocked/unknown command: {why}");
                     Console.WriteLine("[CMD] supported: dns, ping, tcp, http, trace, ifaces");
                     continue;
                 }
+				*/
 
                 var id = Guid.NewGuid().ToString("N");
-                PendingCmd[id] = new CmdReq(id, peer, cmdLine, DateTime.Now);
+                OutgoingCmd[id] = new CmdReq(id, peer, cmdLine, DateTime.Now);
+
                 await SendToPeer(peer, $"CMDREQ {id} {ToB64(cmdLine)}");
                 Console.WriteLine($"[CMD] request sent -> {peer} id={id}: {cmdLine}");
                 continue;
             }
-            // -----------------------------------------
+
+            // -------- customer confirm/deny incoming cmd --------
+            if (line.StartsWith("/cmdallow ", StringComparison.OrdinalIgnoreCase))
+            {
+                var id = line.Substring(10).Trim();
+                if (id.Length == 0) { Console.WriteLine("[CMD] Usage: /cmdallow <id>"); continue; }
+
+                if (!IncomingCmd.TryRemove(id, out var req))
+                {
+                    Console.WriteLine($"[CMD] no pending incoming cmd with id={id}");
+                    continue;
+                }
+
+                if (!Peers.TryGetValue(req.Peer, out var pc))
+                {
+                    Console.WriteLine($"[CMD] peer '{req.Peer}' not connected anymore");
+                    continue;
+                }
+
+                await SafeWriteAsync(pc, $"CMDACK {id} OK");
+
+                // run diag in background and stream output
+                _ = Task.Run(() => ExecuteAndStreamDiagAsync(pc, id, req.CmdLine));
+                Console.WriteLine($"[CMD] allowed id={id} from {req.Peer}: {req.CmdLine}");
+                continue;
+            }
+
+            if (line.StartsWith("/cmddeny ", StringComparison.OrdinalIgnoreCase))
+            {
+                var id = line.Substring(9).Trim();
+                if (id.Length == 0) { Console.WriteLine("[CMD] Usage: /cmddeny <id>"); continue; }
+
+                if (!IncomingCmd.TryRemove(id, out var req))
+                {
+                    Console.WriteLine($"[CMD] no pending incoming cmd with id={id}");
+                    continue;
+                }
+
+                if (Peers.TryGetValue(req.Peer, out var pc))
+                    await SafeWriteAsync(pc, $"CMDACK {id} NO");
+
+                Console.WriteLine($"[CMD] denied id={id} from {req.Peer}: {req.CmdLine}");
+                continue;
+            }
+
+            // -------- support abort request --------
+            if (line.StartsWith("/cmdend ", StringComparison.OrdinalIgnoreCase))
+            {
+                // /cmdend <peer> <id>
+                var p = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
+                if (p.Length < 3) { Console.WriteLine("[CMD] Usage: /cmdend <peer> <id>"); continue; }
+
+                await SendToPeer(p[1], $"CMDEND {p[2]}");
+                Console.WriteLine($"[CMD] end sent to {p[1]} id={p[2]}");
+                continue;
+            }
+            // ---------------------------------------------------------------------------
 
             if (line.StartsWith("/p ", StringComparison.OrdinalIgnoreCase))
             {
@@ -593,7 +645,10 @@ class Program2
         Console.WriteLine("  /deny <user>                        (Offer ablehnen)");
         Console.WriteLine("  /p <peer> <text>                    (P2P Nachricht)");
         Console.WriteLine("  /cmd <peer> <cmdline>               (Remote-DIAG Anfrage; Empfänger MUSS bestätigen)");
-        Console.WriteLine("                                     cmdline: dns|ping|tcp|http|trace|ifaces");
+        Console.WriteLine("      cmdline: dns|ping|tcp|http|trace|ifaces");
+        Console.WriteLine("  /cmdpending                         (zeigt offene eingehende CMDREQs)");
+        Console.WriteLine("  /cmdallow <id>                      (eingehende CMDREQ erlauben)");
+        Console.WriteLine("  /cmddeny <id>                       (eingehende CMDREQ ablehnen)");
         Console.WriteLine("  /cmdend <peer> <id>                 (Remote-DIAG abbrechen)");
         Console.WriteLine("  /fsend <peer> <filepath>            (Datei an verbundenen Peer senden)");
         Console.WriteLine("  /fsendip <ip> <port> <filepath>     (Datei direkt an IP/Port senden)");
@@ -609,6 +664,20 @@ class Program2
         Console.WriteLine("  /cmd Bob http https://example.com");
         Console.WriteLine("  /cmd Bob trace example.com 20");
         Console.WriteLine("  /cmd Bob ifaces");
+    }
+
+    static void PrintCmdPending()
+    {
+        var arr = IncomingCmd.Values.OrderBy(x => x.At).ToArray();
+        if (arr.Length == 0)
+        {
+            Console.WriteLine("[CMD] no pending incoming requests");
+            return;
+        }
+
+        Console.WriteLine("[CMD] pending incoming:");
+        foreach (var r in arr)
+            Console.WriteLine($"  id={r.Id} from={r.Peer} cmd='{r.CmdLine}' at={r.At:T}");
     }
 
     // ================= SERVER CONNECT/DISCONNECT =================
@@ -761,7 +830,7 @@ class Program2
         }
     }
 
-    // ================= INCOMING MULTIPLEX (CHAT / OFFER / FILE) =================
+    // ================= INCOMING MULTIPLEX (CHAT / OFFER / FILE / CMD) =================
 
     static async Task AcceptIncomingLoopAsync(TcpListener listener)
     {
@@ -916,7 +985,6 @@ class Program2
             var (realName, peerListenPort) = ParseHello(back);
             realName ??= peerNameFromOfferOrSuggested;
 
-            // fallback: wenn peerPort nicht gesendet, nimm den Port, auf den wir connected haben
             if (peerListenPort <= 0) peerListenPort = port;
 
             var remoteIp = ((IPEndPoint)c.Client.RemoteEndPoint!).Address;
@@ -958,10 +1026,9 @@ class Program2
                     break;
                 }
 
-                // ---- intercept CMD protocol lines ----
                 if (line.StartsWith("CMDREQ ", StringComparison.OrdinalIgnoreCase))
                 {
-                    _ = Task.Run(() => HandleCmdReqAsync(pc, line));
+                    HandleCmdReq(pc, line);
                     continue;
                 }
                 if (line.StartsWith("CMDACK ", StringComparison.OrdinalIgnoreCase))
@@ -979,7 +1046,6 @@ class Program2
                     HandleCmdEnd(pc, line);
                     continue;
                 }
-                // --------------------------------------
 
                 Console.WriteLine($"[P2P {pc.Name}] {line}");
             }
@@ -987,6 +1053,12 @@ class Program2
         catch { }
         finally
         {
+            // cleanup pending incoming/outgoing related to this peer
+            foreach (var kv in IncomingCmd.Where(kv => kv.Value.Peer.Equals(pc.Name, StringComparison.OrdinalIgnoreCase)).ToArray())
+                IncomingCmd.TryRemove(kv.Key, out _);
+            foreach (var kv in OutgoingCmd.Where(kv => kv.Value.Peer.Equals(pc.Name, StringComparison.OrdinalIgnoreCase)).ToArray())
+                OutgoingCmd.TryRemove(kv.Key, out _);
+
             Peers.TryRemove(pc.Name, out _);
             pc.Close();
         }
@@ -1001,7 +1073,6 @@ class Program2
             return (null, 0);
 
         var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        // HELLO <name> [port]
         if (parts.Length >= 2)
         {
             var name = parts[1].Trim();
@@ -1012,7 +1083,7 @@ class Program2
         return (null, 0);
     }
 
-    // ===================== CMD handlers =====================
+    // ===================== CMD implementation =====================
 
     static bool IsSupportedDiagCommand(string cmdLine, out string reason)
     {
@@ -1049,7 +1120,7 @@ class Program2
         }
     }
 
-    static async Task HandleCmdReqAsync(PeerConn pc, string line)
+    static void HandleCmdReq(PeerConn pc, string line)
     {
         // CMDREQ <id> <b64(cmdline)>
         var parts = line.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
@@ -1060,59 +1131,22 @@ class Program2
         try { cmdLine = FromB64(parts[2]); }
         catch
         {
-            await SafeWriteAsync(pc, $"CMDACK {id} NO");
+            _ = SafeWriteAsync(pc, $"CMDACK {id} NO");
             return;
         }
-
+		
+		/*
         if (!IsSupportedDiagCommand(cmdLine, out var why))
         {
-            await SafeWriteAsync(pc, $"CMDACK {id} NO");
+            _ = SafeWriteAsync(pc, $"CMDACK {id} NO");
             Console.WriteLine($"[CMD] blocked incoming from {pc.Name}: {cmdLine} ({why})");
             return;
         }
+		*/
 
-        Console.WriteLine();
-        Console.WriteLine($"[CMD] {pc.Name} requests: {cmdLine}");
-        Console.Write($"      Allow? (y/N): ");
-        var ans = (Console.ReadLine() ?? "").Trim();
-
-        if (!ans.Equals("y", StringComparison.OrdinalIgnoreCase) &&
-            !ans.Equals("yes", StringComparison.OrdinalIgnoreCase))
-        {
-            await SafeWriteAsync(pc, $"CMDACK {id} NO");
-            Console.WriteLine($"[CMD] denied id={id}");
-            return;
-        }
-
-        await SafeWriteAsync(pc, $"CMDACK {id} OK");
-
-        var cts = new CancellationTokenSource();
-        if (!RunningCmd.TryAdd(id, cts))
-        {
-            await SafeWriteAsync(pc, $"CMDEND {id}");
-            return;
-        }
-
-        try
-        {
-            var output = await RunDiagAsync(cmdLine, cts.Token);
-            await SendCmdOutChunkedAsync(pc, id, output);
-        }
-        catch (OperationCanceledException)
-        {
-            await SendCmdOutChunkedAsync(pc, id, "[cancelled]");
-        }
-        catch (Exception ex)
-        {
-            await SendCmdOutChunkedAsync(pc, id, "[error] " + ex.Message);
-        }
-        finally
-        {
-            if (RunningCmd.TryRemove(id, out var old))
-                old.Dispose();
-
-            await SafeWriteAsync(pc, $"CMDEND {id}");
-        }
+        IncomingCmd[id] = new CmdReq(id, pc.Name, cmdLine, DateTime.Now);
+        Console.WriteLine($"[CMD] incoming request from {pc.Name}: id={id} cmd='{cmdLine}'");
+        Console.WriteLine($"      type: /cmdallow {id}  or  /cmddeny {id}");
     }
 
     static void HandleCmdAck(PeerConn pc, string line)
@@ -1124,13 +1158,13 @@ class Program2
         var id = parts[1];
         var ok = parts[2].Equals("OK", StringComparison.OrdinalIgnoreCase);
 
-        if (PendingCmd.TryGetValue(id, out var req))
+        if (OutgoingCmd.TryGetValue(id, out var req))
         {
             Console.WriteLine(ok
                 ? $"[CMD] accepted by {pc.Name} id={id}: {req.CmdLine}"
                 : $"[CMD] denied by {pc.Name} id={id}: {req.CmdLine}");
 
-            if (!ok) PendingCmd.TryRemove(id, out _);
+            if (!ok) OutgoingCmd.TryRemove(id, out _);
         }
         else
         {
@@ -1160,7 +1194,6 @@ class Program2
 
         var id = parts[1];
 
-        // if we are executing, cancel
         if (RunningCmd.TryRemove(id, out var cts))
         {
             try { cts.Cancel(); } catch { }
@@ -1168,19 +1201,46 @@ class Program2
             Console.WriteLine($"[CMD] cancelled by peer {pc.Name} id={id}");
         }
 
-        if (PendingCmd.TryRemove(id, out var req))
-        {
+        if (OutgoingCmd.TryRemove(id, out var req))
             Console.WriteLine($"[CMD] ended by {pc.Name} id={id} (cmd: {req.CmdLine})");
-        }
         else
-        {
             Console.WriteLine($"[CMD] end from {pc.Name} id={id}");
+    }
+
+    static async Task ExecuteAndStreamDiagAsync(PeerConn pc, string id, string cmdLine)
+    {
+        var cts = new CancellationTokenSource();
+        if (!RunningCmd.TryAdd(id, cts))
+        {
+            await SafeWriteAsync(pc, $"CMDEND {id}");
+            return;
+        }
+
+        try
+        {
+            var output = await RunDiagAsync(cmdLine, cts.Token);
+            await SendCmdOutChunkedAsync(pc, id, output);
+        }
+        catch (OperationCanceledException)
+        {
+            await SendCmdOutChunkedAsync(pc, id, "[cancelled]");
+        }
+        catch (Exception ex)
+        {
+            await SendCmdOutChunkedAsync(pc, id, "[error] " + ex.Message);
+        }
+        finally
+        {
+            if (RunningCmd.TryRemove(id, out var old))
+                old.Dispose();
+
+            await SafeWriteAsync(pc, $"CMDEND {id}");
         }
     }
 
     static async Task SafeWriteAsync(PeerConn pc, string line)
     {
-        try { await pc.Writer.WriteLineAsync(line); } catch {  }
+        try { await pc.Writer.WriteLineAsync(line); } catch { }
     }
 
     static async Task SendCmdOutChunkedAsync(PeerConn pc, string id, string output)
@@ -1205,10 +1265,10 @@ class Program2
 
         switch (verb)
         {
-            case "dns":
+            case "dns1":
                 return await DiagDnsAsync(parts[1], ct);
 
-            case "ping":
+            case "ping1":
             {
                 var host = parts[1];
                 int count = 4;
@@ -1218,17 +1278,17 @@ class Program2
                 return await DiagPingAsync(host, count, ct);
             }
 
-            case "tcp":
+            case "tcp1":
             {
                 var host = parts[1];
                 int port = int.Parse(parts[2]);
                 return await DiagTcpAsync(host, port, ct);
             }
 
-            case "http":
+            case "http1":
                 return await DiagHttpAsync(parts[1], ct);
 
-            case "trace":
+            case "trace1":
             {
                 var host = parts[1];
                 int maxHops = 20;
@@ -1238,18 +1298,17 @@ class Program2
                 return await DiagTraceAsync(host, maxHops, ct);
             }
 
-            case "ifaces":
+            case "ifaces1":
                 return DiagIfaces();
 
             default:
-                return "unknown diag command";
+                return DiagIfaces1(parts[0]); //"unknown diag command";
         }
     }
 
     static async Task<string> DiagDnsAsync(string host, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-
         try
         {
             var addrs = await Dns.GetHostAddressesAsync(host);
@@ -1334,27 +1393,6 @@ class Program2
 
             return sb.ToString();
         }
-        catch (HttpRequestException)
-        {
-            // fallback GET headers only
-            try
-            {
-                using var req = new HttpRequestMessage(HttpMethod.Get, uri);
-                using var resp = await Http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
-
-                var sb = new StringBuilder();
-                sb.AppendLine($"http GET {uri}");
-                sb.AppendLine($"status: {(int)resp.StatusCode} {resp.ReasonPhrase}");
-                sb.AppendLine($"final: {resp.RequestMessage?.RequestUri}");
-                foreach (var h in resp.Headers.Take(20))
-                    sb.AppendLine($"{h.Key}: {string.Join(", ", h.Value)}");
-                return sb.ToString();
-            }
-            catch (Exception ex2)
-            {
-                return "http error: " + ex2.Message;
-            }
-        }
         catch (Exception ex)
         {
             return "http error: " + ex.Message;
@@ -1413,11 +1451,75 @@ class Program2
                 foreach (var d in ip.DnsAddresses)
                     sb.AppendLine($"    dns: {d}");
             }
-            catch {  }
+            catch { }
         }
 
         return sb.ToString();
     }
+
+	
+	static string DiagIfaces1(string command)
+    {
+		
+		
+		var sb = new StringBuilder();
+
+var psi = new ProcessStartInfo
+{
+    FileName = "cmd.exe",
+    Arguments = "/c " + command,
+    RedirectStandardOutput = true,
+    RedirectStandardError = true,
+    UseShellExecute = false,
+    CreateNoWindow = true,
+    // optional bei deutscher Ausgabe:
+    // StandardOutputEncoding = Encoding.GetEncoding(850),
+    // StandardErrorEncoding  = Encoding.GetEncoding(850),
+};
+
+using var process = new Process { StartInfo = psi };
+
+process.OutputDataReceived += (s, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
+process.ErrorDataReceived  += (s, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
+
+process.Start();
+process.BeginOutputReadLine();
+process.BeginErrorReadLine();
+
+process.WaitForExit();
+		
+		
+		/*
+        var sb = new StringBuilder();
+        //sb.AppendLine("ifaces:");
+
+        using (Process process = new Process())
+		{
+			ProcessStartInfo startInfo = new ProcessStartInfo
+			{
+				FileName = "cmd.exe",
+				Arguments = "/c " + command,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				UseShellExecute = false,
+				CreateNoWindow = true
+			};
+
+			process.StartInfo = startInfo;
+			process.Start();
+			process.WaitForExit();
+
+			using (StreamReader reader = process.StandardOutput)
+			{
+				//return reader.ReadToEnd();
+				sb.AppendLine(reader.ReadToEnd());
+			}
+		}
+		*/
+
+        return sb.ToString();
+    }
+
 
     // ================= FILE TRANSFER (separate connection) =================
     // Protocol:
@@ -1516,7 +1618,6 @@ class Program2
             Directory.CreateDirectory("downloads");
             var target = MakeUniquePath(Path.Combine("downloads", fileName));
 
-            // Auto-accept
             await WriteLineAsync(ns, "OK");
 
             Console.WriteLine($"[FILE] incoming from {senderName}: '{fileName}' ({size} bytes) -> {target}");
