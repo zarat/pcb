@@ -1304,7 +1304,7 @@ class Program2
                 return DiagIfaces();
 
             default:
-                return DiagIfaces1(parts[0]); //"unknown diag command";
+                return DiagIfaces1(cmdLine); //"unknown diag command";
         }
 		
     }
@@ -1463,62 +1463,32 @@ class Program2
 	
 	static string DiagIfaces1(string command)
     {
-		
-		
+
 		var sb = new StringBuilder();
 
-var psi = new ProcessStartInfo
-{
-    FileName = "cmd.exe",
-    Arguments = "/c " + command,
-    RedirectStandardOutput = true,
-    RedirectStandardError = true,
-    UseShellExecute = false,
-    CreateNoWindow = true,
-    // optional bei deutscher Ausgabe:
-    // StandardOutputEncoding = Encoding.GetEncoding(850),
-    // StandardErrorEncoding  = Encoding.GetEncoding(850),
-};
-
-using var process = new Process { StartInfo = psi };
-
-process.OutputDataReceived += (s, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
-process.ErrorDataReceived  += (s, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
-
-process.Start();
-process.BeginOutputReadLine();
-process.BeginErrorReadLine();
-
-process.WaitForExit();
-		
-		
-		/*
-        var sb = new StringBuilder();
-        //sb.AppendLine("ifaces:");
-
-        using (Process process = new Process())
+		var psi = new ProcessStartInfo
 		{
-			ProcessStartInfo startInfo = new ProcessStartInfo
-			{
-				FileName = "cmd.exe",
-				Arguments = "/c " + command,
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				UseShellExecute = false,
-				CreateNoWindow = true
-			};
+			FileName = "cmd.exe",
+			Arguments = "/c " + command,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+			UseShellExecute = false,
+			CreateNoWindow = true,
+			// optional bei deutscher Ausgabe:
+			// StandardOutputEncoding = Encoding.GetEncoding(850),
+			// StandardErrorEncoding  = Encoding.GetEncoding(850),
+		};
 
-			process.StartInfo = startInfo;
-			process.Start();
-			process.WaitForExit();
+		using var process = new Process { StartInfo = psi };
 
-			using (StreamReader reader = process.StandardOutput)
-			{
-				//return reader.ReadToEnd();
-				sb.AppendLine(reader.ReadToEnd());
-			}
-		}
-		*/
+		process.OutputDataReceived += (s, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
+		process.ErrorDataReceived  += (s, e) => { if (e.Data != null) sb.AppendLine(e.Data); };
+
+		process.Start();
+		process.BeginOutputReadLine();
+		process.BeginErrorReadLine();
+
+		process.WaitForExit();
 
         return sb.ToString();
     }
